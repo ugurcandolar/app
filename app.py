@@ -1,17 +1,25 @@
-# Web Panel (Streamlit) — Crypto Predator (BINANCE + MEXC)
-# --------------------------------------------------------
+# app.py — Crypto Predator (Web)
+# ------------------------------------------------------------
 # Çalıştırma:
-#   pip install streamlit ccxt pandas numpy requests beautifulsoup4 matplotlib
+#   pip install -r requirements.txt
 #   streamlit run app.py
 #
-# Notlar:
-# - Sadece public uçlar kullanılır (API key gerekmiyor).
-# - Otomatik yenileme Streamlit Cloud uyumlu hale getirildi (st.autorefresh).
-# - Vadeli semboller ccxt'de 'BTC/USDT:USDT' formatındadır.
+# requirements.txt önerisi:
+# streamlit>=1.32
+# ccxt
+# pandas
+# numpy
+# requests
+# beautifulsoup4
+# lxml
+# matplotlib
+#
+# Not: ccxt Cloud'da load_markets() sırasında bloklanırsa otomatik
+# Binance REST fallback'a geçer (ticker/klines için).
+# ------------------------------------------------------------
 
-import time, math, json, io
+import io, time, math, json
 from datetime import datetime
-from typing import List, Dict, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,25 +28,29 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import ccxt
 
-# ------------------ Config ------------------
+# ======================= Config ============================
 APP_TITLE = "Crypto Predator – Web"
 REFRESH_MS = 15_000
+
 SIGNAL_INTERVAL_SEC = 60
 SCALP_INTERVAL_SEC = 20
 FUTURES_FAST_SEC = 5
 TOPN = 10
 
+# “Kafa Coinler” (Binance Futures USDT-M formatı)
 ZERO_FEE_FUTURES = [
     'BTC/USDT:USDT','ETH/USDT:USDT','SOL/USDT:USDT','AVAX/USDT:USDT','SEI/USDT:USDT',
     'MAGIC/USDT:USDT','BNB/USDT:USDT','XRP/USDT:USDT','ADA/USDT:USDT','DOGE/USDT:USDT','SUI/USDT:USDT'
 ]
+
+# MEXC 0 Fee listesi (Spot)
 MEXC_0_FEE = [
     'SOL/USDT','SUI/USDT','ADA/USDT','PEPE/USDT','PUMP/USDT','PENGU/USDT','LTC/USDT',
     'ONDO/USDT','HYPE/USDT','LDO/USDT','AAVE/USDT','XLM/USDT','POPCAT/USDT','ETHFI/USDT',
     'APT/USDT','TONU/USDT','SEI/USDT','WLD/USDT','TAO/USDT','NEAR/USDT','SHIB/USDT'
 ]
+
 RSS_FEEDS = [
     'https://www.coindesk.com/arc/outboundfeeds/rss/',
     'https://cointelegraph.com/rss',
@@ -49,47 +61,9 @@ DEFAULT_LEVERAGE = '10x'
 DEFAULT_SL = '0.6%'
 DEFAULT_TP = '1.2%'
 
-# ------------------ Helpers ------------------
-@st.cache_data(ttl=120)
-def translate_tr(text: str) -> str:
-    text = (text or '').strip()
-    if not text:
-        return text
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client":"gtx","sl":"auto","tl":"tr","dt":"t","q": text[:5000]}
-        j = requests.get(url, params=params, timeout=4).json()
-        return "".join(part[0] for part in j[0] if part and part[0])
-    except Exception:
-        return text
+BIN_HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-@st.cache_data(ttl=300)
-def load_exchanges():
-    spot = ccxt.binance({'enableRateLimit': True})
-    fut = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-    spot.load_markets(); fut.load_markets()
-    mexc = ccxt.mexc({'enableRateLimit': True}); mexc.load_markets()
-    return spot, fut, mexc
-
-@st.cache_data(ttl=30)
-def fetch_tickers(use_futures=True) -> Dict:
-    spot, fut, _ = load_exchanges()
-    ex = fut if use_futures else spot
-    return ex.fetch_tickers()
-
-@st.cache_data(ttl=60)
-def fetch_ohlcv(symbol: str, timeframe: str = '5m', limit: int = 210, use_futures: bool = False):
-    spot, fut, _ = load_exchanges()
-    ex = fut if use_futures else spot
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-@st.cache_data(ttl=60)
-def fetch_ohlcv_mexc(symbol: str, timeframe: str = '5m', limit: int = 210):
-    _, _, mexc = load_exchanges()
-    return mexc.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-# TA
-
+# =================== Basit TA yardımcıları =================
 def ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
 
@@ -112,8 +86,130 @@ def atr(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series
     tr = pd.concat([(h-l), (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-# Signal engine
+# =================== TR çeviri (light) =====================
+@st.cache_data(ttl=120)
+def translate_tr(text: str) -> str:
+    text = (text or '').strip()
+    if not text:
+        return text
+    try:
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {"client":"gtx","sl":"auto","tl":"tr","dt":"t","q": text[:5000]}
+        j = requests.get(url, params=params, timeout=4).json()
+        return "".join(part[0] for part in j[0] if part and part[0])
+    except Exception:
+        return text
 
+# =================== CCXT + Fallback katmanı ===============
+import ccxt
+from ccxt.base.errors import ExchangeNotAvailable, DDoSProtection, NetworkError, RateLimitExceeded
+
+@st.cache_data(ttl=300)
+def _try_ccxt():
+    """CCXT deneyip çalışırsa döndür; aksi halde cloud fallback."""
+    try:
+        spot = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
+        fut  = ccxt.binanceusdm({'enableRateLimit': True, 'timeout': 10000})  # USDT-M
+        spot.load_markets()
+        fut.load_markets()
+        return ('ccxt', spot, fut)
+    except Exception:
+        return ('cloud', None, None)
+
+def _bin_rest(url: str, params: dict | None = None):
+    r = requests.get(url, params=params or {}, headers=BIN_HEADERS, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def load_exchanges():
+    """(spot, fut, mode) döndürür. mode: 'ccxt' veya 'cloud'."""
+    mode, spot, fut = _try_ccxt()
+    return spot, fut, mode
+
+@st.cache_data(ttl=30)
+def fetch_tickers(use_futures: bool = True) -> dict:
+    spot, fut, mode = load_exchanges()
+    if mode == 'ccxt':
+        ex = fut if use_futures else spot
+        return ex.fetch_tickers()
+    # cloud mode → REST
+    if use_futures:
+        data = _bin_rest('https://fapi.binance.com/fapi/v1/ticker/24hr')
+        out = {}
+        for t in data:
+            s = t['symbol']
+            if s.endswith('USDT'):
+                sym = s.replace('USDT', '/USDT:USDT')
+                out[sym] = {
+                    'last': float(t['lastPrice']),
+                    'percentage': float(t['priceChangePercent']),
+                }
+        return out
+    else:
+        data = _bin_rest('https://api.binance.com/api/v3/ticker/24hr')
+        out = {}
+        for t in data:
+            s = t['symbol']
+            if s.endswith('USDT'):
+                sym = s.replace('USDT', '/USDT')
+                out[sym] = {
+                    'last': float(t['lastPrice']),
+                    'percentage': float(t['priceChangePercent']),
+                }
+        return out
+
+@st.cache_data(ttl=60)
+def fetch_ohlcv(symbol: str, timeframe: str = '5m', limit: int = 210, use_futures: bool = False):
+    spot, fut, mode = load_exchanges()
+    if mode == 'ccxt':
+        ex = fut if use_futures else spot
+        return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    # cloud mode → REST klines
+    tf = timeframe
+    sym = symbol.replace('/USDT:USDT', 'USDT').replace('/USDT', 'USDT')
+    if use_futures:
+        url = 'https://fapi.binance.com/fapi/v1/klines'
+    else:
+        url = 'https://api.binance.com/api/v3/klines'
+    kl = _bin_rest(url, {'symbol': sym, 'interval': tf, 'limit': limit})
+    # [openTime, open, high, low, close, volume, ...]
+    return [[k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in kl]
+
+@st.cache_data(ttl=60)
+def fetch_ohlcv_mexc(symbol: str, timeframe: str = '5m', limit: int = 210):
+    # Cloud’da MEXC bazen kısıtlıyor; ccxt olmazsa boş döneriz.
+    try:
+        mexc = ccxt.mexc({'enableRateLimit': True})
+        mexc.load_markets()
+        return mexc.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except Exception:
+        return []
+
+@st.cache_data(ttl=300)
+def list_spot_usdt_pairs() -> list[str]:
+    spot, fut, mode = load_exchanges()
+    if mode == 'ccxt':
+        return [s for s in spot.symbols if s.endswith('/USDT')]
+    info = _bin_rest('https://api.binance.com/api/v3/exchangeInfo')
+    out = []
+    for s in info.get('symbols', []):
+        if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING':
+            out.append(f"{s['symbol'].replace('USDT','/USDT')}")
+    return out
+
+@st.cache_data(ttl=300)
+def list_futures_usdt_pairs() -> list[str]:
+    spot, fut, mode = load_exchanges()
+    if mode == 'ccxt':
+        return [s for s in fut.symbols if s.endswith(':USDT')]
+    info = _bin_rest('https://fapi.binance.com/fapi/v1/exchangeInfo')
+    out = []
+    for s in info.get('symbols', []):
+        if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING':
+            out.append(f"{s['symbol'].replace('USDT','/USDT:USDT')}")
+    return out
+
+# =================== Sinyal Motoru =========================
 def compute_swing(symbol: str, use_futures: bool) -> dict | None:
     try:
         o = fetch_ohlcv(symbol, '5m', 210, use_futures)
@@ -172,26 +268,16 @@ def compute_scalp(symbol: str) -> dict | None:
     except Exception:
         return None
 
-# Styling helpers
-
-def style_direction(val: str):
-    if isinstance(val, str) and 'LONG' in val:
-        return 'color: #22c55e; font-weight:600'
-    if isinstance(val, str) and 'SHORT' in val:
-        return 'color: #ef4444; font-weight:600'
-    return 'color: #94a3b8'
-
-# -------------- UI --------------
+# =================== UI ==============================
 st.set_page_config(page_title=APP_TITLE, layout='wide')
 st.title(APP_TITLE)
 
-# Auto-refresh (Streamlit Cloud uyumlu)
+# Auto-refresh (Cloud uyumlu)
 try:
     st.autorefresh(interval=REFRESH_MS, key='auto')
 except Exception:
     pass
 
-# Sidebar controls
 with st.sidebar:
     st.subheader("Ayarlar")
     show_mexc = st.checkbox("MEXC 0 Fee sekmesi", value=True)
@@ -201,7 +287,7 @@ with st.sidebar:
             st.rerun()
         except Exception:
             pass
-    st.caption("Veriler ccxt ile çekilir. Hızlı yenilemede borsa rate‑limit uygulayabilir.")
+    st.caption("Veriler halka açık uçlardan çekilir; çok sık yenileme rate-limit’e yol açabilir.")
 
 # Tabs
 T1, T2, T3, T4, T5, T6, T7, T8, T9 = st.tabs([
@@ -217,11 +303,13 @@ with T3:
     rows = []
     for sym, info in t.items():
         try:
-            if not (sym.endswith('/USDT') or sym.endswith(':USDT')): continue
+            if not (sym.endswith('/USDT') or sym.endswith(':USDT')): 
+                continue
             price = info.get('last') or info.get('close')
             pct = info.get('percentage')
             rows.append([sym, price, pct, 'BINANCE FUTURES'])
-        except: pass
+        except: 
+            pass
     dfp = pd.DataFrame(rows, columns=['Sembol','Fiyat','%24h','Kaynak']).sort_values('Sembol')
     def _fmt_pct(v):
         try:
@@ -231,57 +319,46 @@ with T3:
     dfp['%24h'] = dfp['%24h'].apply(_fmt_pct)
     st.dataframe(dfp.head(max_rows), use_container_width=True)
 
-# --- All Coins Signals ---
+# --- All Coins Signals (Spot) ---
 with T1:
     st.subheader('Tüm Coinler – Sinyal (Spot USDT)')
-    spot_syms = [s for s in load_exchanges()[0].symbols if s.endswith('/USDT')][:300]
-    out = []
-    for s in spot_syms:
-        r = compute_swing(s, use_futures=False)
-        if r: out.append(r)
+    spot_syms = list_spot_usdt_pairs()[:300]
+    out = [r for r in (compute_swing(s, False) for s in spot_syms) if r]
     dfa = pd.DataFrame(out).sort_values('Skor', ascending=False).head(max_rows)
     if not dfa.empty:
-        st.dataframe(dfa.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+        st.dataframe(dfa, use_container_width=True)
     else:
-        st.info('Veri bulunamadı veya rate-limit. Tekrar deneyin.')
+        st.info('Veri yok veya rate-limit. Tekrar deneyin.')
 
-# --- Kafa Coinler (Futures) ---
+# --- Kafa Coinler (Futures 5m) ---
 with T2:
     st.subheader('Kafa Coinler – Futures 5m Swing')
-    out = []
-    for s in ZERO_FEE_FUTURES:
-        r = compute_swing(s, use_futures=True)
-        if r: out.append(r)
+    out = [r for r in (compute_swing(s, True) for s in ZERO_FEE_FUTURES) if r]
     dfz = pd.DataFrame(out).sort_values('Skor', ascending=False).head(max_rows)
     if not dfz.empty:
-        st.dataframe(dfz.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+        st.dataframe(dfz, use_container_width=True)
     else:
         st.warning('Şu anda sinyal yok.')
 
 # --- Scalp (1m Futures) ---
 with T4:
     st.subheader('Vur-Kaç (Scalp) – 1m Futures')
-    fut_syms = [s for s in load_exchanges()[1].symbols if s.endswith(':USDT')][:200]
-    out = []
-    for s in fut_syms:
-        r = compute_scalp(s)
-        if r: out.append(r)
+    fut_syms = list_futures_usdt_pairs()[:200]
+    out = [r for r in (compute_scalp(s) for s in fut_syms) if r]
     dfs = pd.DataFrame(out).sort_values('Skor', ascending=False).head(max_rows)
     if not dfs.empty:
-        st.dataframe(dfs.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+        st.dataframe(dfs, use_container_width=True)
     else:
         st.info('Şu an scalp tetik yok.')
 
-# --- Futures Quick (fast heuristics) ---
+# --- Futures Quick (aynı scalp kurallarının hızlı taraması) ---
 with T5:
     st.subheader('Vadeli Hızlı – 1m Momentum')
-    out = []
-    for s in ZERO_FEE_FUTURES:
-        r = compute_scalp(s)
-        if r: out.append(r)
+    fut_syms = list_futures_usdt_pairs()[:200]
+    out = [r for r in (compute_scalp(s) for s in fut_syms) if r]
     dfq = pd.DataFrame(out).sort_values('Skor', ascending=False).head(min(30, max_rows))
     if not dfq.empty:
-        st.dataframe(dfq.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+        st.dataframe(dfq, use_container_width=True)
     else:
         st.info('Hızlı tetik yok.')
 
@@ -289,7 +366,7 @@ with T5:
 with T6:
     if show_mexc:
         st.subheader('MEXC 0 Fee – Spot 5m Swing')
-        out = []
+        res = []
         for s in MEXC_0_FEE:
             try:
                 o = fetch_ohlcv_mexc(s, '5m', 210)
@@ -311,17 +388,17 @@ with T6:
                 elif trend=='Boğa': score+=20; direction='Long'; comment='Trend boğa'
                 elif trend=='Ayı': score+=20; direction='Short'; comment='Trend ayı'
                 else: score+=10
-                out.append({'Yön':'▲ LONG' if direction=='Long' else ('▼ SHORT' if direction=='Short' else '— BEKLE'),
-                            'Tarz':'Swing','TF':'5m','Sembol':s,'Fiyat':price,'Skor':score,'RSI':round(float(r),2),
+                res.append({'Yön':'▲ LONG' if direction=='Long' else ('▼ SHORT' if direction=='Short' else '— BEKLE'),
+                            'Tarz':'Swing','TF':'5m','Sembol':s,'Fiyat':price,'Skor':int(score),'RSI':round(float(r),2),
                             'MACD':round(float(m_line.iloc[-1]),4),'Trend':trend,'Yorum':comment,'Lev':DEFAULT_LEVERAGE,
                             'SL':'3%','TP':'15%','Not':''})
             except Exception:
                 continue
-        dfm = pd.DataFrame(out).sort_values('Skor', ascending=False).head(max_rows)
+        dfm = pd.DataFrame(res).sort_values('Skor', ascending=False).head(max_rows)
         if not dfm.empty:
-            st.dataframe(dfm.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+            st.dataframe(dfm, use_container_width=True)
         else:
-            st.info('MEXC verisi şu an boş veya rate-limit.')
+            st.info('MEXC verisi boş veya rate-limit.')
     else:
         st.info('Sol menüden MEXC sekmesini açabilirsin.')
 
@@ -359,18 +436,18 @@ with T7:
         st.markdown('**Gainers**')
         for s, p, last in gain:
             colA, colB, colC = st.columns([3,1,2])
-            colA.write(f"**{s}**  ")
+            colA.write(f"**{s}**")
             colB.write(f"**{p:.2f}%**")
             colC.image(plot_spark(s))
     with cg2:
         st.markdown('**Losers**')
         for s, p, last in loss:
             colA, colB, colC = st.columns([3,1,2])
-            colA.write(f"**{s}**  ")
+            colA.write(f"**{s}**")
             colB.write(f"**{p:.2f}%**")
             colC.image(plot_spark(s))
 
-# --- News (TR) ---
+# --- Haberler (TR başlık) ---
 with T8:
     st.subheader('Haberler (Türkçe başlık)')
     items = []
@@ -389,9 +466,9 @@ with T8:
             continue
     dfn = pd.DataFrame(items)[:40]
     st.dataframe(dfn, use_container_width=True)
-    st.caption('Satıra tıklayıp sağdaki Link hücresini kopyalayarak açabilirsin.')
+    st.caption('Satıra tıklayıp sağdaki Link değerini kopyalayarak açabilirsin.')
 
-# --- Kasa Yönetimi (öneri) basit sürüm ---
+# --- Kasa Yönetimi (öneri) basit ---
 with T9:
     st.subheader('Kasa Yönetimi – Öneri Dağıtımı (Basit)')
     colA, colB, colC, colD = st.columns(4)
@@ -399,25 +476,24 @@ with T9:
     risk_pct = colB.number_input('Risk / İşlem (%)', min_value=0.1, value=1.0, step=0.1)
     lev = colC.number_input('Kaldıraç', min_value=1, max_value=125, value=10, step=1)
     max_pos = colD.number_input('Max Pozisyon', min_value=1, max_value=10, value=3, step=1)
+    st.caption('Adaylar: Kafa Coinler + 1m momentum tetikleri. SL/TP varsayılan (0.6% / 1.2%).')
 
-    st.caption('Adaylar: Kafa Coinler + Scalp üstleri. SL/TP sabit varsayılmıştır (0.6% / 1.2%).')
-    cand = []
-    for s in ZERO_FEE_FUTURES:
-        r = compute_scalp(s)
-        if r: cand.append(r)
-    cand = sorted(cand, key=lambda x:x['Skor'], reverse=True)[:max_pos]
+    cand_syms = ZERO_FEE_FUTURES
+    cands = [r for r in (compute_scalp(s) for s in cand_syms) if r]
+    cands = sorted(cands, key=lambda x:x['Skor'], reverse=True)[:max_pos]
 
     rows = []
     risk_dollars = cap * (risk_pct/100.0)
     remain = cap
-    for c in cand:
+    for c in cands:
         slp = 0.6
         notional = risk_dollars / (slp/100.0)
         margin = notional / max(1, lev)
         if margin > remain:
             notional = remain * lev
             margin = remain
-        if margin <= 0: continue
+        if margin <= 0: 
+            continue
         qty = notional / max(1e-9, float(c['Fiyat']))
         rows.append({
             'Sembol': c['Sembol'], 'Yön': c['Yön'], 'Tarz': c['Tarz'], 'TF': c['TF'], 'Skor': c['Skor'],
@@ -426,10 +502,11 @@ with T9:
         })
         remain -= margin
         if remain <= 0: break
+
     dfl = pd.DataFrame(rows)
     if not dfl.empty:
-        st.dataframe(dfl.style.applymap(style_direction, subset=['Yön']), use_container_width=True)
+        st.dataframe(dfl, use_container_width=True)
     else:
         st.info('Aday sinyal yok. Üst sekmelerde tetik oluşunca burada belirecek.')
 
-st.caption(f"Son güncelleme: {datetime.utcnow().strftime('%H:%M:%S')} UTC | Otomatik yenileme: {REFRESH_MS/1000:.0f}s")
+st.caption(f"Son güncelleme: {datetime.utcnow().strftime('%H:%M:%S')} UTC | Auto-refresh: {REFRESH_MS/1000:.0f}s")
