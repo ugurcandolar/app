@@ -1,13 +1,13 @@
 # Web Panel (Streamlit) — Crypto Predator (BINANCE + MEXC)
 # --------------------------------------------------------
-# Run:
+# Çalıştırma:
 #   pip install streamlit ccxt pandas numpy requests beautifulsoup4 matplotlib
 #   streamlit run app.py
 #
-# Notes:
-# - Uses public endpoints (no API key). If you later trade, wire keys via env.
-# - Refreshes automatically every N seconds via st.autorefresh.
-# - Futures symbols: 'BTC/USDT:USDT' form (ccxt Binance linear futures).
+# Notlar:
+# - Sadece public uçlar kullanılır (API key gerekmiyor).
+# - Otomatik yenileme Streamlit Cloud uyumlu hale getirildi (st.autorefresh).
+# - Vadeli semboller ccxt'de 'BTC/USDT:USDT' formatındadır.
 
 import time, math, json, io
 from datetime import datetime
@@ -185,17 +185,23 @@ def style_direction(val: str):
 st.set_page_config(page_title=APP_TITLE, layout='wide')
 st.title(APP_TITLE)
 
-# Auto-refresh
-st_autorefresh = st.experimental_rerun  # fallback alias if older streamlit
-st_autorefresh = st.autorefresh if hasattr(st, 'autorefresh') else (lambda **kw: None)
-st_autorefresh(interval=REFRESH_MS, key='auto')
+# Auto-refresh (Streamlit Cloud uyumlu)
+try:
+    st.autorefresh(interval=REFRESH_MS, key='auto')
+except Exception:
+    pass
 
 # Sidebar controls
 with st.sidebar:
     st.subheader("Ayarlar")
     show_mexc = st.checkbox("MEXC 0 Fee sekmesi", value=True)
     max_rows = st.slider("Tablo satır limiti", 20, 400, 100, 10)
-    st.caption("Veriler ccxt üzerinden çekilir. Aşırı isteklerde rate-limit olabilir.")
+    if st.button("🔄 Yenile"):
+        try:
+            st.rerun()
+        except Exception:
+            pass
+    st.caption("Veriler ccxt ile çekilir. Hızlı yenilemede borsa rate‑limit uygulayabilir.")
 
 # Tabs
 T1, T2, T3, T4, T5, T6, T7, T8, T9 = st.tabs([
@@ -269,7 +275,6 @@ with T4:
 # --- Futures Quick (fast heuristics) ---
 with T5:
     st.subheader('Vadeli Hızlı – 1m Momentum')
-    # burada scalp ile aynı kuralları kullanıp yalnız üst sıraları gösteriyoruz
     out = []
     for s in ZERO_FEE_FUTURES:
         r = compute_scalp(s)
@@ -397,7 +402,6 @@ with T9:
 
     st.caption('Adaylar: Kafa Coinler + Scalp üstleri. SL/TP sabit varsayılmıştır (0.6% / 1.2%).')
     cand = []
-    # add futures quick (here reusing scalp )
     for s in ZERO_FEE_FUTURES:
         r = compute_scalp(s)
         if r: cand.append(r)
